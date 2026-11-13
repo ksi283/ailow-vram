@@ -1,0 +1,109 @@
+# ============================================================================
+# LLM Local — llama.cpp server (API tương thích OpenAI + WebUI tích hợp sẵn)
+#
+# Model (lấy từ model-name.txt):
+#   xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic  (~9.65B, BF16 ≈ 19GB)
+#
+# Máy chỉ có RTX 4060 8GB VRAM → không chạy được bản BF16 gốc.
+# → Dùng bản GGUF Q4_K_M (5.24 GiB) do mradermacher quant từ CHÍNH model đó,
+#   kèm mmproj Q8_0 (0.58 GiB) để giữ khả năng hiểu ảnh (vision).
+#
+# Yêu cầu: đã cài nvidia-container-toolkit (xem mục "Sự cố thường gặp" trong
+# README.md — máy này hiện CHƯA cài, GPU passthrough đang báo lỗi).
+# ============================================================================
+
+name: llm-local
+
+services:
+  llama-server:
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
+    container_name: llm-local-server
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    environment:
+      # Repo GGUF + phiên bản quant — llama-server tự tải từ Hugging Face
+      # và cache vào volume bên dưới (không tải lại các lần sau)
+      LLAMA_ARG_HF_REPO: ${GGUF_REPO:-mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF}:${QUANT:-Q4_K_M}
+      # Tên viết gọn khi gọi API (trường "model" — dùng tên nào cũng được,
+      # đây chỉ là tên hiển thị trong /v1/models)
+      LLAMA_ARG_ALIAS: ${SERVED_MODEL_NAME:-deepseek-v4-pro}
+      LLAMA_ARG_HOST: 0.0.0.0
+      LLAMA_ARG_PORT: "8000"
+      # Độ dài context (tokens). Giảm xuống 4096 nếu cần nhường VRAM.
+      # Model hỗ trợ tối đa 262144 nhưng 8GB VRAM chỉ đủ thoải mái ở mức thấp.
+      LLAMA_ARG_CTX_SIZE: ${CTX_SIZE:-8192}
+      # Để dư bao nhiêu MiB VRAM trước khi tự cân chỉnh (fit) ctx/số layer
+      # trên GPU. Mặc định llama.cpp để 1024 — với card 8GB để 512 cho vừa
+      # đủ offload toàn bộ model lên GPU.
+      LLAMA_ARG_FIT_TARGET: ${FIT_TARGET:-512}
+      # Bật endpoint /metrics (Prometheus)
+      LLAMA_ARG_ENDPOINT_METRICS: 1
+
+      # ---- Tùy chọn (bỏ dấu # để bật) --------------------------------------
+      # Tắt vision (không tải mmproj, nhường lại ~0.58 GiB VRAM):
+      # LLAMA_ARG_MMPROJ_AUTO: 0
+      #
+      # Bảo vệ API bằng key (client gọi kèm header "Authorization: Bearer ..."):
+      # LLAMA_API_KEY: ${API_KEY:-}
+      #
+      # Token Hugging Face (model này public nên không cần):
+      # HF_TOKEN: ${HF_TOKEN:-}
+
+    volumes:
+      # Cache model đã tải (~5.9 GiB với Q4_K_M + mmproj)
+      - model-cache:/root/.cache
+    healthcheck:
+      # /health trả 503 trong lúc đang tải/load model, 200 khi sẵn sàng
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Lần đầu phải tải ~5.9 GiB model + load vào GPU
+      start_period: 30m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Chạy chế độ CPU (không GPU): đổi LLAMA_IMAGE=ghcr.io/ggml-org/llama.cpp:server
+    # trong .env VÀ xóa khối "devices" phía trên.
+
+  # --------------------------------------------------------------------------
+  # Open WebUI — giao diện chat có quản lý conversation theo project (folder):
+  # tạo project mới, tạo conversation trong/ngoài project, kéo-di chuyển
+  # conversation giữa các project. Lưu trữ phía server trong volume.
+  # --------------------------------------------------------------------------
+  open-webui:
+    image: ${OPENWEBUI_IMAGE:-ghcr.io/open-webui/open-webui:main}
+    container_name: llm-local-webui
+    restart: unless-stopped
+    ports:
+      - "${WEBUI_PORT:-3001}:8080"
+    environment:
+      # Trỏ về llama-server qua mạng nội bộ của compose (không qua host)
+      OPENAI_API_BASE_URL: http://llama-server:8000/v1
+      # llama-server không kiểm tra key — điền giá trị bất kỳ
+      OPENAI_API_KEY: sk-local
+      # Tắt phần tích hợp Ollama (stack này dùng llama-server)
+      ENABLE_OLLAMA_API: "false"
+      WEBUI_NAME: "LLM Local"
+      # Bỏ đăng nhập (mọi người vào thẳng) — KHÔNG khuyến nghị nếu mở ra LAN:
+      # WEBUI_AUTH: "false"
+    volumes:
+      - openwebui-data:/app/backend/data
+    depends_on:
+      llama-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 5m
+
+volumes:
+  model-cache:
+  openwebui-data:
